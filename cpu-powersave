@@ -1,0 +1,681 @@
+#!/bin/bash
+#==============================================================================
+# cpu-powersave - cap CPU power and frequency on Linux, persistently.
+#
+# Detects your hardware, asks what to cap, then installs a systemd service
+# that reapplies the settings at every boot.
+#
+#   cpu-powersave                          interactive
+#   cpu-powersave --eco                    profile, no questions asked
+#   cpu-powersave --no-turbo --min 2.0GHz --power 35
+#   cpu-powersave --status                 read only
+#   cpu-powersave --revert                 undo everything
+#
+# https://github.com/Lousblue/cpu-powersave                        MIT licence
+#==============================================================================
+set -euo pipefail
+
+CONF='/etc/default/cpu-powersave'
+APPLY='/usr/local/sbin/cpu-powersave-apply'
+UNIT='/etc/systemd/system/cpu-powersave.service'
+SERVICE='cpu-powersave.service'
+
+CPUDIR='/sys/devices/system/cpu'
+PSTATE="$CPUDIR/intel_pstate/no_turbo"   # Intel: 1 disables turbo
+BOOST="$CPUDIR/cpufreq/boost"            # everyone else: 0 disables boost
+RAPL='/sys/class/powercap/intel-rapl:0'  # package power limit, Intel only
+
+DEFAULT_TAU=28          # seconds, the window the power limit averages over
+ECO_POWER_PCT=70        # --eco caps power at this share of the current limit
+
+#--- Output -------------------------------------------------------------------
+if [ -t 1 ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'
+else
+  R=; B=; D=; C=; G=; Y=; E=
+fi
+# Blocks: Hardware, Questions, To apply, In force.
+title() { printf '\n%s%s%s\n' "$B" "$1" "$R"; }
+kv()    { printf '  %-13s %s\n' "$1" "$2"; }
+note()  { printf '  %s%s%s\n' "$D" "$1" "$R"; }
+warn()  { printf '  %s!%s %s\n' "$Y" "$R" "$1" >&2; }
+die()   { printf '%serror:%s %s\n' "$E" "$R" "$1" >&2; exit 1; }
+hint()  { echo; note "$1"; }
+plural() { if [ "$1" = 1 ]; then echo "1 $2"; else echo "$1 ${3:-${2}s}"; fi; }
+
+# Steps: a framed box per step while installing or reverting.
+STEP=0; TOTAL=0; WARNINGS=0
+step()  { STEP=$((STEP + 1)); printf '\n%s┌─ [%d/%d] %s%s\n' "$C" "$STEP" "$TOTAL" "$1" "$R"; }
+info()  { printf '%s│%s  %-13s %s\n' "$C" "$R" "$1" "$2"; }
+flag()  { printf '%s│%s  %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; WARNINGS=$((WARNINGS + 1)); }
+ok()    { printf '%s└─%s %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; }
+stop()  { printf '%s└─%s %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; WARNINGS=$((WARNINGS + 1)); }
+# Prints a grouped list inside a step, one group per line, aligned.
+ginfo() {   # ginfo <label> <producer> <formatter>
+  local label="$1" lines first=1 l
+  lines="$("$2" | "$3")"
+  if [ -z "$lines" ]; then info "$label" 'not readable'; return; fi
+  while IFS= read -r l; do
+    if [ "$first" = 1 ]; then info "$label" "$l"; first=0
+    else                      info ''       "$l"; fi
+  done <<< "$lines"
+}
+
+#--- Units --------------------------------------------------------------------
+# Accepts 2.5GHz, 2500MHz, 2500000kHz, a comma as decimal separator, and a
+# bare number guessed by size: under 100 is GHz, under 100000 is MHz, above
+# is kHz. Prints kHz, the unit the kernel uses. Fails on what it cannot parse.
+to_khz() {
+  local v="${1// /}" n u
+  v="${v//,/.}"
+  case "$v" in
+    ''|*[!0-9.GgMmKkHhZz]*) return 1 ;;
+  esac
+  case "$v" in
+    *[Gg][Hh][Zz]) n="${v%%[Gg]*}"; u=1000000 ;;
+    *[Mm][Hh][Zz]) n="${v%%[Mm]*}"; u=1000    ;;
+    *[Kk][Hh][Zz]) n="${v%%[Kk]*}"; u=1       ;;
+    *) n="$v"
+       u="$(awk -v n="$v" 'BEGIN { if (n + 0 < 100) print 1000000; else if (n + 0 < 100000) print 1000; else print 1 }')" ;;
+  esac
+  awk -v n="$n" -v u="$u" 'BEGIN { if (n + 0 <= 0) exit 1; printf "%d", n * u }'
+}
+mhz() { awk -v k="$1" 'BEGIN { printf "%d", k / 1000 }'; }
+
+#--- Hardware detection -------------------------------------------------------
+cpu_model() { grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//'; }
+driver()    { cat "$CPUDIR/cpu0/cpufreq/scaling_driver" 2>/dev/null || echo unknown; }
+ncores()    { local n=0 c; for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+                if [ -d "$c" ]; then n=$((n + 1)); fi; done; echo "$n"; }
+
+# on / off / unsupported. Note the two knobs are inverted with respect to
+# each other: intel_pstate exposes "no_turbo", everyone else "boost".
+turbo_state() {
+  if [ -r "$PSTATE" ]; then
+    if [ "$(cat "$PSTATE")" = 1 ]; then echo off; else echo on; fi
+  elif [ -r "$BOOST" ]; then
+    if [ "$(cat "$BOOST")" = 1 ]; then echo on; else echo off; fi
+  else
+    echo unsupported
+  fi
+}
+
+epp_now()       { cat "$CPUDIR/cpu0/cpufreq/energy_performance_preference" 2>/dev/null || true; }
+governor_now()  { cat "$CPUDIR/cpu0/cpufreq/scaling_governor" 2>/dev/null || true; }
+epp_available() { cat "$CPUDIR/cpu0/cpufreq/energy_performance_available_preferences" 2>/dev/null || true; }
+power_now_uw()  { cat "$RAPL/constraint_0_power_limit_uw" 2>/dev/null || echo 0; }
+power_max_uw()  { cat "$RAPL/constraint_0_max_power_uw"   2>/dev/null || echo 0; }
+
+# Per-core base clock and current ceiling, grouped and counted. On a hybrid
+# CPU the P, E and LP-E cores differ, and a single min-to-max range hides that.
+# The ceiling is whatever the driver reports right now: with turbo already off
+# it equals the base clock, and no sysfs file remembers the turbo figure.
+core_groups() {
+  local c base max
+  for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+    base="$(cat "$c/base_frequency" 2>/dev/null || echo 0)"
+    max="$(cat "$c/cpuinfo_max_freq" 2>/dev/null || echo 0)"
+    [ "$max" -gt 0 ] || continue
+    echo "$base $max"
+  done | sort -rn | uniq -c
+}
+
+# Same, but the bounds actually in force right now.
+applied_groups() {
+  local c a b
+  for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+    a="$(cat "$c/scaling_min_freq" 2>/dev/null || true)"
+    b="$(cat "$c/scaling_max_freq" 2>/dev/null || true)"
+    if [ -n "$a" ] && [ -n "$b" ]; then echo "$a $b"; fi
+  done | sort -rn | uniq -c
+}
+
+# Prints a grouped list under a label, one group per line, aligned.
+grouped() {   # grouped <label> <producer> <formatter>
+  local label="$1" lines first=1 l
+  lines="$("$2" | "$3")"
+  if [ -z "$lines" ]; then kv "$label" 'not readable'; return; fi
+  while IFS= read -r l; do
+    if [ "$first" = 1 ]; then kv "$label" "$l"; first=0
+    else                      kv ''       "$l"; fi
+  done <<< "$lines"
+}
+fmt_hardware() {
+  awk '{ if ($2 > 0) printf "%2d cores  base %d  max %d MHz\n", $1, $2/1000, $3/1000
+         else         printf "%2d cores  max %d MHz\n",          $1, $3/1000 }'
+}
+fmt_applied() {
+  # floor equal to ceiling means the core cannot reach the requested floor
+  # and has been pinned to its own ceiling.
+  awk '{ if ($2 == $3) printf "%2d cores  %d MHz (pinned)\n", $1, $2/1000
+         else          printf "%2d cores  %d-%d MHz\n",       $1, $2/1000, $3/1000 }'
+}
+
+show_hardware() {
+  local t p pm
+  title 'Hardware'
+  kv 'cpu'    "$(cpu_model)"
+  kv 'cores'  "$(ncores)  ($(driver))"
+  grouped 'frequency' core_groups fmt_hardware
+  t="$(turbo_state)"
+  kv 'turbo' "$t"
+  p="$(power_now_uw)"; pm="$(power_max_uw)"
+  if [ "$p" -gt 0 ]; then
+    if [ "$pm" -gt 0 ]; then kv 'power limit' "$((p / 1000000)) W  (hardware maximum $((pm / 1000000)) W)"
+    else                     kv 'power limit' "$((p / 1000000)) W"; fi
+  else
+    kv 'power limit' 'not available on this CPU'
+  fi
+}
+
+#--- Status -------------------------------------------------------------------
+show_status() {
+  local act ena p
+  show_hardware
+  title 'In force'
+  act="$(systemctl is-active  "$SERVICE" 2>/dev/null || true)"
+  ena="$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+  kv 'service' "${act:-absent} / ${ena:-absent}"
+  grouped 'frequency' applied_groups fmt_applied
+  kv 'preference' "$(epp_now || true)"
+  p="$(power_now_uw)"
+  if [ "$p" -gt 0 ]; then kv 'power' "$((p / 1000000)) W"; fi
+  if [ -f "$CONF" ]; then
+    title 'Settings'
+    note "from $CONF"
+    grep -v '^#' "$CONF" | grep . | sed 's/^/  /'
+  fi
+}
+
+#--- Help ---------------------------------------------------------------------
+usage() {
+  cat <<EOF
+cpu-powersave - cap CPU power and frequency, persistently.
+
+usage: cpu-powersave [options]
+
+  Run with no options on a terminal and it asks what to cap, showing the
+  values it detected. Pass any option and it applies them without asking.
+
+profiles
+  --eco              turbo off, floor at half the base clock,
+                     power capped at ${ECO_POWER_PCT}% of the current limit
+  --balanced         turbo off, nothing else
+  --performance      turbo on, every cap removed
+
+settings
+  --turbo on|off     turbo boost
+  --no-turbo         same as --turbo off
+  --min FREQ         frequency floor, e.g. 2.0GHz, 2000MHz (empty = none)
+  --max FREQ         frequency ceiling
+  --epp NAME         energy preference: $(epp_available | tr ' ' '|' | grep . || echo 'none exposed by this CPU')
+  --power WATTS      package power limit, Intel only (0 = leave alone)
+  --tau SECONDS      window the power limit averages over (default $DEFAULT_TAU)
+
+other
+  --status           show hardware and what is in force, change nothing
+  --dry-run          show what would be applied, then stop
+  --revert           remove the service and restore the firmware defaults
+  --yes, -y          never ask: turbo off, nothing else
+  --help, -h         this text
+
+Frequency floors are clamped per core: a core whose ceiling is below the
+requested floor is pinned at its ceiling rather than refused.
+EOF
+}
+
+#--- Arguments ----------------------------------------------------------------
+MODE='apply'
+ASSUME_YES=0
+DRY_RUN=0
+GIVEN=0          # any setting passed on the command line?
+SET_TURBO=''
+SET_MIN=''
+SET_MAX=''
+SET_EPP=''
+SET_POWER=''
+SET_TAU="$DEFAULT_TAU"
+PROFILE=''
+
+need_arg() { [ -n "${2:-}" ] || die "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)      MODE='status' ;;
+    --revert)      MODE='revert' ;;
+    --help|-h)     usage; exit 0 ;;
+    --yes|-y)      ASSUME_YES=1 ;;
+    --dry-run)     DRY_RUN=1 ;;
+    --eco)         PROFILE='eco';         GIVEN=1 ;;
+    --balanced)    PROFILE='balanced';    GIVEN=1 ;;
+    --performance) PROFILE='performance'; GIVEN=1 ;;
+    --no-turbo)    SET_TURBO='off';       GIVEN=1 ;;
+    --turbo)       need_arg "$1" "${2:-}"; SET_TURBO="$2"; GIVEN=1; shift ;;
+    --min)         need_arg "$1" "${2:-}"; SET_MIN="$2";   GIVEN=1; shift ;;
+    --max)         need_arg "$1" "${2:-}"; SET_MAX="$2";   GIVEN=1; shift ;;
+    --epp)         need_arg "$1" "${2:-}"; SET_EPP="$2";   GIVEN=1; shift ;;
+    --power)       need_arg "$1" "${2:-}"; SET_POWER="$2"; GIVEN=1; shift ;;
+    --tau)         need_arg "$1" "${2:-}"; SET_TAU="$2";            shift ;;
+    *)             printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+case "${SET_TURBO:-on}" in on|off) ;; *) die "--turbo takes on or off" ;; esac
+
+#--- Elevation ----------------------------------------------------------------
+# Reading state needs no privilege, so --status never asks for a password.
+if [ "$(id -u)" -eq 0 ] || [ "$MODE" = 'status' ]; then
+  SUDO=''
+else
+  command -v sudo >/dev/null || die 'run as root, or install sudo'
+  SUDO='sudo'
+fi
+
+#--- Modes that exit early ----------------------------------------------------
+if [ "$MODE" = 'status' ]; then
+  show_status
+  echo
+  exit 0
+fi
+
+if [ "$MODE" = 'revert' ]; then
+  TOTAL=2
+  step 'Boot service'
+  # Read the firmware values back before deleting the file that holds them.
+  ORIG_POWER_UW=0; ORIG_GOVERNOR=''
+  if [ -f "$UNIT" ] || [ -f "$APPLY" ] || [ -f "$CONF" ]; then
+    if [ -r "$CONF" ]; then
+      # shellcheck disable=SC1090
+      . "$CONF"
+    fi
+    $SUDO systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+    $SUDO rm -f "$UNIT" "$APPLY" "$CONF"
+    $SUDO systemctl daemon-reload
+    info 'removed' "$UNIT"
+    info ''        "$APPLY"
+    info ''        "$CONF"
+    ok 'service stopped and removed, nothing runs at boot any more'
+  else
+    ok 'nothing was installed'
+  fi
+
+  step 'Firmware defaults'
+  if   [ -w "$PSTATE" ]; then echo 0 | $SUDO tee "$PSTATE" >/dev/null || true
+  elif [ -w "$BOOST"  ]; then echo 1 | $SUDO tee "$BOOST"  >/dev/null || true
+  fi
+  for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+    $SUDO cp "$c/cpuinfo_min_freq" "$c/scaling_min_freq" 2>/dev/null || true
+    $SUDO cp "$c/cpuinfo_max_freq" "$c/scaling_max_freq" 2>/dev/null || true
+    # The governor matters on acpi-cpufreq, where the default is not powersave.
+    if [ -n "${ORIG_GOVERNOR:-}" ] && [ -w "$c/scaling_governor" ]; then
+      echo "$ORIG_GOVERNOR" | $SUDO tee "$c/scaling_governor" >/dev/null 2>&1 || true
+    fi
+    if [ -w "$c/energy_performance_preference" ]; then
+      echo default | $SUDO tee "$c/energy_performance_preference" >/dev/null 2>&1 \
+        || echo balance_performance | $SUDO tee "$c/energy_performance_preference" >/dev/null 2>&1 \
+        || true
+    fi
+  done
+  info 'turbo'      "$(turbo_state)"
+  info 'frequency'  'bounds released, every core back to its full range'
+  [ -n "${ORIG_GOVERNOR:-}" ] && info 'governor' "$ORIG_GOVERNOR"
+  info 'preference' "$(epp_now || true)"
+  # The power limit is restored from the value saved at install time. Without
+  # it the cap would survive until the next reboot.
+  if [ "${ORIG_POWER_UW:-0}" -gt 0 ] && [ -w "$RAPL/constraint_0_power_limit_uw" ]; then
+    if echo "$ORIG_POWER_UW" | $SUDO tee "$RAPL/constraint_0_power_limit_uw" >/dev/null 2>&1; then
+      info 'power limit' "$((ORIG_POWER_UW / 1000000)) W"
+    else
+      flag 'the power limit could not be restored - it clears at the next reboot'
+    fi
+  fi
+  if [ "$WARNINGS" = 0 ]; then ok 'restored, the CPU is back to how the firmware set it'
+  else stop "restored with $(plural "$WARNINGS" warning)"; fi
+  echo
+  exit 0
+fi
+
+#==============================================================================
+# Install
+#==============================================================================
+[ -r "$CPUDIR/cpu0/cpufreq/scaling_max_freq" ] \
+  || die "no cpufreq driver on this machine - nothing to cap ($CPUDIR/cpu0/cpufreq is missing)"
+
+show_hardware
+
+TURBO_SUPPORTED="$(turbo_state)"
+POWER_AVAILABLE=0
+if [ "$(power_now_uw)" -gt 0 ] && [ -w "$RAPL/constraint_0_power_limit_uw" ]; then POWER_AVAILABLE=1; fi
+
+# The firmware values, remembered for --revert. On a reinstall they must be
+# read from the previous settings, not from the hardware: by then the hardware
+# shows the cap we applied last time, and --revert would "restore" that.
+ORIG_POWER_UW="$(power_now_uw)"
+ORIG_GOVERNOR="$(governor_now)"
+if [ -r "$CONF" ]; then
+  PREV_POWER="$(sed -n 's/^ORIG_POWER_UW=//p' "$CONF" | head -1)"
+  PREV_GOV="$(sed -n 's/^ORIG_GOVERNOR=//p' "$CONF" | head -1)"
+  if [ "${PREV_POWER:-0}" -gt 0 ] 2>/dev/null; then ORIG_POWER_UW="$PREV_POWER"; fi
+  if [ -n "$PREV_GOV" ]; then ORIG_GOVERNOR="$PREV_GOV"; fi
+fi
+
+# Highest base clock across cores, used by --eco to pick a floor.
+BASE_MAX="$(core_groups | awk '{ if ($2 > m) m = $2 } END { print m + 0 }')"
+# --eco takes its percentage from the firmware limit, so running it twice does
+# not cap 70% of 70%.
+POWER_NOW_W=$(( $(power_now_uw) / 1000000 ))
+POWER_ORIG_W=$(( ORIG_POWER_UW / 1000000 ))
+POWER_MAX_W=$(( $(power_max_uw) / 1000000 ))
+
+#--- Profiles -----------------------------------------------------------------
+case "$PROFILE" in
+  eco)
+    SET_TURBO="${SET_TURBO:-off}"
+    if [ -z "$SET_MIN" ] && [ "$BASE_MAX" -gt 0 ]; then SET_MIN="$((BASE_MAX / 2))kHz"; fi
+    if [ -z "$SET_POWER" ] && [ "$POWER_ORIG_W" -gt 0 ]; then
+      SET_POWER="$(( POWER_ORIG_W * ECO_POWER_PCT / 100 ))"
+    fi
+    SET_EPP="${SET_EPP:-power}"
+    ;;
+  balanced)
+    SET_TURBO="${SET_TURBO:-off}"
+    SET_EPP="${SET_EPP:-balance_power}"
+    ;;
+  performance)
+    SET_TURBO="${SET_TURBO:-on}"
+    SET_EPP="${SET_EPP:-performance}"
+    SET_MIN=''; SET_MAX=''; SET_POWER=0
+    ;;
+esac
+
+#--- Interactive --------------------------------------------------------------
+# Only when nothing was asked for and someone is actually there to answer.
+# Both answer into ANS rather than on stdout: bash prints the read prompt on
+# one stream or the other depending on the build, and a captured prompt would
+# end up inside the answer.
+ANS=''
+ask()    { local a; read -r -p "  $1" a || a=''; ANS="${a:-$2}"; }
+ask_yn() { local a; read -r -p "  $1 [Y/n] " a || a=''
+           case "${a:-y}" in [Nn]*) ANS=no ;; *) ANS=yes ;; esac; }
+
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  title 'Questions'
+  note 'press enter to accept the value in brackets'
+
+  if [ "$TURBO_SUPPORTED" != 'unsupported' ]; then
+    hint 'Turbo lets cores run above their base clock in short bursts. It is the biggest single power draw on a machine that mostly waits.'
+    # "on or off", not a yes/no: a question phrased as "disable?" gets answered
+    # backwards by whoever reads it as "do you want turbo?".
+    while :; do
+      ask 'Turbo boost, on or off [off]: ' 'off'
+      case "$ANS" in
+        [Oo][Nn])     SET_TURBO='on';  break ;;
+        [Oo][Ff][Ff]) SET_TURBO='off'; break ;;
+        *) warn 'type on or off' ;;
+      esac
+    done
+  fi
+
+  hint 'The lowest clock the cores may drop to when idle. Empty lets them go as low as they can, which saves the most.'
+  while :; do
+    ask 'Frequency floor, e.g. 2.0GHz (empty = none): ' ''
+    SET_MIN="$ANS"
+    if [ -z "$SET_MIN" ] || to_khz "$SET_MIN" >/dev/null 2>&1; then break; fi
+    warn "cannot read '$SET_MIN' as a frequency"
+  done
+  hint 'The highest clock the cores may reach under load. With turbo off, the base clock is already the ceiling.'
+  while :; do
+    ask 'Frequency ceiling (empty = none): ' ''
+    SET_MAX="$ANS"
+    if [ -z "$SET_MAX" ] || to_khz "$SET_MAX" >/dev/null 2>&1; then break; fi
+    warn "cannot read '$SET_MAX' as a frequency"
+  done
+
+  AVAIL="$(epp_available)"
+  if [ -n "$AVAIL" ]; then
+    hint 'How eagerly the CPU clocks up when work arrives. "power" waits longest, "performance" jumps at once.'
+    # The kernel decides the order of this list, so the default is picked by
+    # name. Never by position: on Intel, position 2 is "performance".
+    i=0; LIST=''; DEF=1; FALLBACK=0
+    for e in $AVAIL; do
+      i=$((i + 1)); LIST="$LIST $i) $e "
+      case "$e" in
+        balance_power) DEF="$i" ;;
+        power)         FALLBACK="$i" ;;
+      esac
+    done
+    if [ "$DEF" = 1 ] && [ "$FALLBACK" != 0 ]; then DEF="$FALLBACK"; fi
+    while :; do
+      ask "Energy preference:${LIST}[$DEF]: " "$DEF"
+      SET_EPP="$(echo "$AVAIL" | awk -v n="$ANS" '{ print $(n + 0) }')"
+      if [ -n "$SET_EPP" ]; then break; fi
+      warn "pick a number between 1 and $i"
+    done
+  fi
+
+  if [ "$POWER_AVAILABLE" = 1 ]; then
+    hint 'The most the whole CPU package may draw, averaged over a few seconds. Lower means cooler and slower under sustained load.'
+    # Not every CPU reports a hardware maximum; say nothing rather than "max 0".
+    if [ "$POWER_MAX_W" -gt 0 ]; then MAXTXT=", max $POWER_MAX_W"; else MAXTXT=''; fi
+    while :; do
+      ask "Power limit in watts$MAXTXT (0 = leave alone) [$POWER_NOW_W]: " "$POWER_NOW_W"
+      SET_POWER="$ANS"
+      case "$SET_POWER" in
+        ''|*[!0-9]*) warn 'whole numbers only' ;;
+        *) if [ "$POWER_MAX_W" -gt 0 ] && [ "$SET_POWER" -gt "$POWER_MAX_W" ]; then
+             warn "the hardware refuses anything above $POWER_MAX_W W"
+           else break; fi ;;
+      esac
+    done
+  fi
+fi
+
+#--- Normalise ----------------------------------------------------------------
+SET_TURBO="${SET_TURBO:-off}"
+SET_POWER="${SET_POWER:-0}"
+MIN_KHZ=0; MAX_KHZ=0
+if [ -n "$SET_MIN" ]; then MIN_KHZ="$(to_khz "$SET_MIN")" || die "cannot read '$SET_MIN' as a frequency"; fi
+if [ -n "$SET_MAX" ]; then MAX_KHZ="$(to_khz "$SET_MAX")" || die "cannot read '$SET_MAX' as a frequency"; fi
+if [ "$MIN_KHZ" -gt 0 ] && [ "$MAX_KHZ" -gt 0 ] && [ "$MIN_KHZ" -gt "$MAX_KHZ" ]; then
+  die "the floor ($(mhz "$MIN_KHZ") MHz) is above the ceiling ($(mhz "$MAX_KHZ") MHz)"
+fi
+case "$SET_POWER" in *[!0-9]*) die '--power takes a whole number of watts' ;; esac
+case "$SET_TAU"   in *[!0-9]*) die '--tau takes a whole number of seconds' ;; esac
+if [ "$SET_POWER" -gt 0 ] && [ "$POWER_AVAILABLE" = 0 ]; then
+  warn 'this CPU does not expose a writable power limit - that setting is ignored'
+  SET_POWER=0
+fi
+if [ "$TURBO_SUPPORTED" = 'unsupported' ]; then
+  warn 'no turbo control on this CPU - that setting is ignored'
+fi
+
+#--- Summary and confirmation -------------------------------------------------
+title 'To apply'
+kv 'turbo'      "$SET_TURBO"
+if [ "$MIN_KHZ" -gt 0 ]; then kv 'floor'   "$(mhz "$MIN_KHZ") MHz"; else kv 'floor'   'none'; fi
+if [ "$MAX_KHZ" -gt 0 ]; then kv 'ceiling' "$(mhz "$MAX_KHZ") MHz"; else kv 'ceiling' 'none'; fi
+kv 'preference' "${SET_EPP:-unchanged}"
+if [ "$SET_POWER" -gt 0 ]; then kv 'power' "$SET_POWER W over ${SET_TAU}s"; else kv 'power' 'unchanged'; fi
+if [ "$SET_TURBO" = 'off' ] && [ "$MAX_KHZ" = 0 ]; then
+  note 'with turbo off every core is capped at its base clock'
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  printf '\n  %sdry run: nothing changed%s\n\n' "$D" "$R"
+  exit 0
+fi
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  echo
+  ask_yn 'Apply and enable at boot?'
+  if [ "$ANS" != yes ]; then echo '  nothing changed'; echo; exit 0; fi
+fi
+
+#--- Write --------------------------------------------------------------------
+TOTAL=3
+step 'Settings'
+$SUDO tee "$CONF" >/dev/null <<EOF
+# Written by cpu-powersave. Read at every boot by $SERVICE.
+# Edit, then: systemctl restart $SERVICE
+TURBO=$SET_TURBO
+MIN_KHZ=$MIN_KHZ
+MAX_KHZ=$MAX_KHZ
+EPP=$SET_EPP
+POWER_W=$SET_POWER
+TAU_S=$SET_TAU
+# Firmware values found before the first install, restored by --revert.
+ORIG_POWER_UW=$ORIG_POWER_UW
+ORIG_GOVERNOR=$ORIG_GOVERNOR
+EOF
+$SUDO chmod 644 "$CONF"
+info 'file' "$CONF"
+ok 'written, read at every boot'
+
+step 'Boot service'
+$SUDO install -d /usr/local/sbin
+$SUDO tee "$APPLY" >/dev/null <<'EOF'
+#!/bin/bash
+#--- Applies the settings. Run by cpu-powersave.service at every boot. ---------
+# No "set -e": a knob the firmware refuses must not stop the ones that would
+# have worked.
+set -uo pipefail
+
+CPUDIR='/sys/devices/system/cpu'
+PSTATE="$CPUDIR/intel_pstate/no_turbo"
+BOOST="$CPUDIR/cpufreq/boost"
+RAPL='/sys/class/powercap/intel-rapl:0'
+
+[ -r /etc/default/cpu-powersave ] && . /etc/default/cpu-powersave
+TURBO="${TURBO:-off}"
+MIN_KHZ="${MIN_KHZ:-0}"
+MAX_KHZ="${MAX_KHZ:-0}"
+EPP="${EPP:-}"
+POWER_W="${POWER_W:-0}"
+TAU_S="${TAU_S:-28}"
+
+# 1. Turbo first: the driver recomputes the ceilings it reports the moment
+#    turbo changes, so the bounds below must be written after it.
+if [ -w "$PSTATE" ]; then
+  if [ "$TURBO" = off ]; then echo 1 > "$PSTATE" 2>/dev/null || true
+  else                        echo 0 > "$PSTATE" 2>/dev/null || true; fi
+elif [ -w "$BOOST" ]; then
+  if [ "$TURBO" = off ]; then echo 0 > "$BOOST" 2>/dev/null || true
+  else                        echo 1 > "$BOOST" 2>/dev/null || true; fi
+fi
+
+# 2. Powersave governor, written straight to sysfs so no package is needed.
+for f in "$CPUDIR"/cpu[0-9]*/cpufreq/scaling_governor; do
+  if [ -w "$f" ]; then echo powersave > "$f" 2>/dev/null || true; fi
+done
+
+# 3. Bounds, clamped to what each core can actually do. This matters on hybrid
+#    CPUs: the small cores top out well below the big ones, and a floor they
+#    cannot reach would simply be refused.
+for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+  [ -w "$c/scaling_max_freq" ] || continue
+  hw_min="$(cat "$c/cpuinfo_min_freq" 2>/dev/null || echo 0)"
+  hw_max="$(cat "$c/cpuinfo_max_freq" 2>/dev/null || echo 0)"
+  [ "$hw_max" -gt 0 ] || continue
+  mx="$MAX_KHZ"
+  if [ "$mx" -le 0 ] || [ "$mx" -gt "$hw_max" ]; then mx="$hw_max"; fi
+  mn="$MIN_KHZ"
+  if [ "$mn" -le 0 ];        then mn="$hw_min"; fi
+  if [ "$mn" -gt "$mx" ];    then mn="$mx";     fi
+  if [ "$mn" -lt "$hw_min" ]; then mn="$hw_min"; fi
+  # ceiling, floor, ceiling: the kernel rejects a floor above the current
+  # ceiling, and the second write fixes whichever order it needed.
+  echo "$mx" > "$c/scaling_max_freq" 2>/dev/null || true
+  echo "$mn" > "$c/scaling_min_freq" 2>/dev/null || true
+  echo "$mx" > "$c/scaling_max_freq" 2>/dev/null || true
+done
+
+# 4. Energy preference: tells the hardware governor how eagerly to clock up.
+if [ -n "$EPP" ]; then
+  for f in "$CPUDIR"/cpu[0-9]*/cpufreq/energy_performance_preference; do
+    if [ -w "$f" ]; then echo "$EPP" > "$f" 2>/dev/null || true; fi
+  done
+fi
+
+# 5. Package power limit, integrated graphics included. Often locked by the
+#    firmware, and the file can claim to be writable and still refuse: errors
+#    are silenced here, cpu-powersave reports them at install time.
+if [ "$POWER_W" -gt 0 ] && [ -w "$RAPL/constraint_0_power_limit_uw" ]; then
+  echo $((POWER_W * 1000000)) > "$RAPL/constraint_0_power_limit_uw" 2>/dev/null || true
+  if [ -w "$RAPL/constraint_0_time_window_us" ]; then
+    echo $((TAU_S * 1000000)) > "$RAPL/constraint_0_time_window_us" 2>/dev/null || true
+  fi
+fi
+
+exit 0
+EOF
+$SUDO chmod 755 "$APPLY"
+$SUDO bash -n "$APPLY"
+
+$SUDO tee "$UNIT" >/dev/null <<EOF
+[Unit]
+Description=Cap CPU power and frequency
+Documentation=file://$CONF
+Documentation=https://github.com/Lousblue/cpu-powersave
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$APPLY
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$SUDO systemctl daemon-reload
+info 'helper'  "$APPLY"
+info 'service' "$UNIT"
+
+#--- Enable and check ---------------------------------------------------------
+# restart, not "enable --now": the service is a oneshot that stays active once
+# it has run, and starting an active service does nothing. On a second install
+# the new settings would sit in the file until the next reboot.
+$SUDO systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+$SUDO systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+ACT="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+if [ "$ACT" != 'active' ]; then
+  printf '%s└─ ✗ the service did not start - systemctl status %s%s\n' "$E" "$SERVICE" "$R" >&2
+  exit 1
+fi
+ok 'enabled and started, the settings return at every boot'
+
+# The firmware has the last word on turbo, the power limit and the bounds:
+# read everything back and say what it kept.
+step 'Check'
+if [ "$TURBO_SUPPORTED" != 'unsupported' ] && [ "$(turbo_state)" != "$SET_TURBO" ]; then
+  flag "turbo is still $(turbo_state) - the firmware refused to change it"
+else
+  info 'turbo' "$(turbo_state)"
+fi
+ginfo 'frequency' applied_groups fmt_applied
+info 'preference' "$(epp_now || true)"
+if [ "$SET_POWER" -gt 0 ] && [ "$(power_now_uw)" != "$((SET_POWER * 1000000))" ]; then
+  flag 'the power limit was refused - the firmware has it locked'
+elif [ "$(power_now_uw)" -gt 0 ]; then
+  info 'power' "$(( $(power_now_uw) / 1000000 )) W"
+fi
+bad=0
+for c in "$CPUDIR"/cpu[0-9]*/cpufreq; do
+  hw_min="$(cat "$c/cpuinfo_min_freq" 2>/dev/null || echo 0)"
+  hw_max="$(cat "$c/cpuinfo_max_freq" 2>/dev/null || echo 0)"
+  [ "$hw_max" -gt 0 ] || continue
+  mx="$MAX_KHZ"; if [ "$mx" -le 0 ] || [ "$mx" -gt "$hw_max" ]; then mx="$hw_max"; fi
+  mn="$MIN_KHZ"; if [ "$mn" -le 0 ]; then mn="$hw_min"; fi
+  if [ "$mn" -gt "$mx" ];     then mn="$mx";     fi
+  if [ "$mn" -lt "$hw_min" ]; then mn="$hw_min"; fi
+  if [ "$(cat "$c/scaling_min_freq")" != "$mn" ] || [ "$(cat "$c/scaling_max_freq")" != "$mx" ]; then
+    bad=$((bad + 1))
+  fi
+done
+[ "$bad" -gt 0 ] && flag "$(plural "$bad" core) did not take the bounds - journalctl -u $SERVICE"
+if [ "$WARNINGS" = 0 ]; then
+  ok 'everything applied, and reapplied at every boot'
+else
+  stop "applied with $(plural "$WARNINGS" warning) - the firmware kept its own value there"
+fi
+echo
